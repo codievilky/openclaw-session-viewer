@@ -181,7 +181,7 @@ function rememberTimelineKeys(items) {
 
 function renderTimeline(items, { preserveScroll = false } = {}) {
   const nextItems = items || [];
-  const newKeys = collectNewTimelineKeys(currentTimelineItems, nextItems);
+  const newKeys = collectNewTimelineKeys(nextItems);
   const render = () => {
     currentTimelineItems = nextItems;
     if (!nextItems.length) {
