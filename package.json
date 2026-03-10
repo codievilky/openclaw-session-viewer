@@ -1,20 +1,26 @@
 {
   "name": "openclaw-session-viewer",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "OpenClaw 本地会话查看器",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
+    "build": "vite build",
+    "start": "npm run build && node server.js",
+    "dev": "npm run build && node server.js",
     "test": "echo \"No tests yet\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "express": "^5.2.1",
-    "marked": "^15.0.7",
     "dompurify": "^3.2.6",
-    "jsdom": "^26.1.0"
+    "express": "^5.2.1",
+    "jsdom": "^26.1.0",
+    "marked": "^15.0.7",
+    "vue": "^3.5.30"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.4",
+    "vite": "^7.3.1"
   }
 }

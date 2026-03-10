@@ -9,3 +9,6 @@ coverage/
 .idea/
 .tmp/
 tmp/
+
+dist/
+.npm-cache/

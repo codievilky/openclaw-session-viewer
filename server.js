@@ -8,6 +8,7 @@ const { JSDOM } = require('jsdom');
 const app = express();
 const PORT = process.env.PORT || 3847;
 const DEFAULT_SESSIONS_ROOT = path.join(os.homedir(), '.openclaw', 'agents');
+const CLIENT_DIST_DIR = path.join(__dirname, 'dist');
 
 function resolveSessionsRoot() {
   const configured = (process.env.OPENCLAW_SESSIONS_ROOT || process.env.OPENCLAW_AGENTS_ROOT || '').trim();
@@ -27,7 +28,21 @@ marked.setOptions({
 });
 
 app.use(express.json({ limit: '2mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(CLIENT_DIST_DIR, {
+  index: false,
+  etag: true,
+  maxAge: '1y',
+  immutable: true,
+  setHeaders(res, filePath) {
+    if (filePath.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-store');
+      return;
+    }
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  },
+}));
+
+const sessionFileCache = new Map();
 
 function safeReadJson(file) {
   try {
@@ -54,6 +69,126 @@ function parseJsonl(filePath) {
   } catch {
     return [];
   }
+}
+
+function getFirstMessageTimestamp(events) {
+  for (const event of events || []) {
+    if (event?.type !== 'message' || !event.message) continue;
+    return event.timestamp || event.message.timestamp || null;
+  }
+  return null;
+}
+
+function getContentText(content) {
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((item) => {
+      if (!item || typeof item !== 'object') return '';
+      if (item.type === 'text') return String(item.text || '');
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function safeParseJson(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function getAgentIdFromSessionKey(sessionKey = '') {
+  const match = String(sessionKey || '').match(/^agent:([^:]+):/);
+  return match ? match[1] : null;
+}
+
+function extractChildCompletionRecords(events) {
+  const records = [];
+
+  for (const event of events || []) {
+    if (event?.type !== 'message' || !event.message) continue;
+    const message = event.message;
+    const text = getContentText(message.content);
+    if (!text.includes('[Internal task completion event]')) continue;
+
+    const sessionIdMatch = text.match(/\nsession_id:\s*([^\n]+)/);
+    const sessionKeyMatch = text.match(/\nsession_key:\s*([^\n]+)/);
+    const sessionId = sessionIdMatch ? sessionIdMatch[1].trim() : null;
+    const childSessionKey = sessionKeyMatch ? sessionKeyMatch[1].trim() : null;
+    if (!sessionId && !childSessionKey) continue;
+
+    records.push({
+      timestamp: event.timestamp || message.timestamp || null,
+      sessionId,
+      childSessionKey,
+      agentId: getAgentIdFromSessionKey(childSessionKey),
+    });
+  }
+
+  return records;
+}
+
+function extractSessionsSpawnRecords(events) {
+  const records = [];
+
+  for (const event of events || []) {
+    if (event?.type !== 'message' || !event.message) continue;
+    const message = event.message;
+    const toolName = message.toolName || message.name || '';
+    if (String(message.role || '').toLowerCase() !== 'toolresult' || toolName !== 'sessions_spawn') continue;
+
+    const parsed = safeParseJson(message.details)
+      || safeParseJson(getContentText(message.content))
+      || null;
+    const childSessionKey = parsed?.childSessionKey || message.childSessionKey || null;
+    if (!childSessionKey) continue;
+
+    records.push({
+      timestamp: event.timestamp || message.timestamp || null,
+      childSessionKey,
+      agentId: getAgentIdFromSessionKey(childSessionKey),
+    });
+  }
+
+  return records;
+}
+
+function getFileFingerprint(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return { mtimeMs: stat.mtimeMs, size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+function getSessionFileSnapshot(filePath) {
+  const fingerprint = getFileFingerprint(filePath);
+  if (!fingerprint) {
+    return { events: [], summary: summarizeEvents([]) };
+  }
+
+  const cached = sessionFileCache.get(filePath);
+  if (cached && cached.mtimeMs === fingerprint.mtimeMs && cached.size === fingerprint.size) {
+    return cached;
+  }
+
+  const events = parseJsonl(filePath);
+  const snapshot = {
+    mtimeMs: fingerprint.mtimeMs,
+    size: fingerprint.size,
+    events,
+    summary: summarizeEvents(events),
+    firstMessageAt: getFirstMessageTimestamp(events),
+    spawnRecords: extractSessionsSpawnRecords(events),
+    completionRecords: extractChildCompletionRecords(events),
+  };
+  sessionFileCache.set(filePath, snapshot);
+  return snapshot;
 }
 
 function walkSessionDirs() {
@@ -134,8 +269,7 @@ function stripEnvelopePrefix(text) {
   return output.replace(/^[\s:：\-—]+/, '');
 }
 
-function stripSenderMetadataBlock(text) {
-  const marker = 'Sender (untrusted metadata):';
+function stripMetadataBlock(text, marker) {
   let output = String(text || '');
   while (true) {
     const idx = output.indexOf(marker);
@@ -155,9 +289,18 @@ function stripSenderMetadataBlock(text) {
   return output;
 }
 
+function stripConversationMetadataBlock(text) {
+  return stripMetadataBlock(text, 'Conversation info (untrusted metadata):');
+}
+
+function stripSenderMetadataBlock(text) {
+  return stripMetadataBlock(text, 'Sender (untrusted metadata):');
+}
+
 function cleanDisplayText(text) {
   let output = String(text || '');
   output = stripEnvelopePrefix(output);
+  output = stripConversationMetadataBlock(output);
   output = stripSenderMetadataBlock(output);
   output = output.replace(/\[\[reply_to_current\]\]/g, '');
   output = output.replace(/\[\[reply_to:[^\]]+\]\]/g, '');
@@ -402,6 +545,117 @@ function summarizeEvents(events) {
   return { startAt, endAt, firstUser, lastText, messageCount, visibleMessageCount, toolCallCount, toolResultCount };
 }
 
+function stripHistorySuffix(sessionKey = '') {
+  return String(sessionKey || '').replace(/::(?:reset|deleted):.+$/, '');
+}
+
+function normalizeTimestampValue(value) {
+  if (!value) return value;
+  if (typeof value !== 'string') return value;
+  return value.replace(/T(\d{2})-(\d{2})-(\d{2}(?:\.\d+)?Z)$/, 'T$1:$2:$3');
+}
+
+function getRowTimestamp(row, field = 'default') {
+  let value = null;
+
+  if (field === 'firstMessage') {
+    value = row?.firstMessageAt || row?.summary?.startAt || null;
+  } else if (row?.isHistory) {
+    value = row?.historySnapshotAt || row?.updatedAt || row?.summary?.endAt || row?.firstMessageAt || row?.summary?.startAt || null;
+  } else {
+    value = row?.summary?.endAt || row?.updatedAt || row?.firstMessageAt || row?.summary?.startAt || row?.historySnapshotAt || null;
+  }
+
+  const timestamp = new Date(normalizeTimestampValue(value) || 0).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function getMissingHistoryChild(sessionKey, timestamp, childSessionKey) {
+  return {
+    missing: true,
+    sessionKey: childSessionKey || `missing:${sessionKey}:${timestamp || 'unknown'}`,
+    agent: getAgentIdFromSessionKey(childSessionKey) || 'subagent',
+    label: '历史会话找不到',
+    startAt: timestamp || null,
+    endAt: timestamp || null,
+    visibleMessageCount: 0,
+  };
+}
+
+function inferHistoryParentLinks(rows) {
+  const bySessionKey = new Map(rows.map((row) => [row.sessionKey, row]));
+  const byBaseSessionKey = new Map(rows.map((row) => [row.baseSessionKey || row.sessionKey, row]));
+  const bySessionId = new Map(rows.map((row) => [row.sessionId, row]));
+  const historyCandidatesByAgent = new Map();
+
+  for (const row of rows) {
+    row.missingChildren = [];
+    if (!row.isHistory || row.agent === 'main' || row.spawnedBy) continue;
+    if (!historyCandidatesByAgent.has(row.agent)) historyCandidatesByAgent.set(row.agent, []);
+    historyCandidatesByAgent.get(row.agent).push(row);
+  }
+
+  for (const list of historyCandidatesByAgent.values()) {
+    list.sort((a, b) => getRowTimestamp(a, 'firstMessage') - getRowTimestamp(b, 'firstMessage'));
+  }
+
+  const mainRows = rows.filter((row) => row.agent === 'main');
+
+  for (const parent of mainRows) {
+    for (const completion of parent.completionRecords || []) {
+      const exactBySessionId = completion.sessionId ? bySessionId.get(completion.sessionId) : null;
+      const exactBySessionKey = completion.childSessionKey ? (bySessionKey.get(completion.childSessionKey) || byBaseSessionKey.get(completion.childSessionKey) || null) : null;
+      const exactChild = exactBySessionId || exactBySessionKey || null;
+      if (!exactChild || exactChild.spawnedBy) continue;
+      exactChild.spawnedBy = parent.sessionKey;
+      exactChild.inferredSpawnedBy = true;
+      exactChild.spawnDepth = exactChild.spawnDepth ?? 1;
+    }
+
+    for (const record of parent.spawnRecords || []) {
+      const exactChild = bySessionKey.get(record.childSessionKey) || byBaseSessionKey.get(record.childSessionKey) || null;
+      if (exactChild && !exactChild.spawnedBy) {
+        exactChild.spawnedBy = parent.sessionKey;
+        exactChild.spawnDepth = exactChild.spawnDepth ?? 1;
+        continue;
+      }
+
+      if (!parent.isHistory) continue;
+
+      const agentId = record.agentId;
+      if (!agentId) {
+        parent.missingChildren.push(getMissingHistoryChild(parent.sessionKey, record.timestamp, record.childSessionKey));
+        continue;
+      }
+
+      const spawnAt = new Date(normalizeTimestampValue(record.timestamp) || 0).getTime();
+      const parentSnapshotAt = getRowTimestamp(parent);
+      const candidates = (historyCandidatesByAgent.get(agentId) || [])
+        .filter((candidate) => !candidate.spawnedBy)
+        .filter((candidate) => candidate.historyType === parent.historyType)
+        .map((candidate) => ({
+          candidate,
+          startDelta: Math.abs(getRowTimestamp(candidate, 'firstMessage') - spawnAt),
+          snapshotDelta: Math.abs(getRowTimestamp(candidate) - parentSnapshotAt),
+        }))
+        .filter(({ startDelta, snapshotDelta }) => startDelta <= 2 * 60 * 1000 && snapshotDelta <= 10 * 60 * 1000)
+        .sort((a, b) => (a.startDelta - b.startDelta) || (a.snapshotDelta - b.snapshotDelta));
+
+      if (!candidates.length) {
+        parent.missingChildren.push(getMissingHistoryChild(parent.sessionKey, record.timestamp, record.childSessionKey));
+        continue;
+      }
+
+      const matched = candidates[0].candidate;
+      matched.spawnedBy = parent.sessionKey;
+      matched.inferredSpawnedBy = true;
+      matched.spawnDepth = matched.spawnDepth ?? 1;
+    }
+  }
+
+  return rows;
+}
+
 function isMainSession(row) {
   if (!row) return false;
   return !row.spawnedBy;
@@ -412,7 +666,9 @@ function loadRegistry() {
 
   for (const { agent, sessionsDir } of walkSessionDirs()) {
     const sessionsJson = safeReadJson(path.join(sessionsDir, 'sessions.json')) || {};
-    const fileEntries = fs.readdirSync(sessionsDir).filter((name) => name.endsWith('.jsonl'));
+    const fileEntries = fs.readdirSync(sessionsDir).filter((name) => (
+      name.endsWith('.jsonl') || name.includes('.jsonl.reset.') || name.includes('.jsonl.deleted.')
+    ));
 
     const sessionMap = new Map();
     const seenSessionIds = new Set();
@@ -423,27 +679,40 @@ function loadRegistry() {
     }
 
     for (const fileName of fileEntries) {
-      const sessionId = fileName.replace(/\.jsonl$/, '');
-      seenSessionIds.add(sessionId);
+      const historyMatch = fileName.match(/^(.+)\.jsonl\.(reset|deleted)\.(.+)$/);
+      const isHistory = Boolean(historyMatch);
+      const sessionId = isHistory ? historyMatch[1] : fileName.replace(/\.jsonl$/, '');
+      const historyType = isHistory ? historyMatch[2] : null;
+      const historySnapshotAt = isHistory ? historyMatch[3] : null;
+      if (!isHistory) seenSessionIds.add(sessionId);
       const reg = sessionMap.get(sessionId);
       const filePath = path.join(sessionsDir, fileName);
-      const events = parseJsonl(filePath);
-      const summary = summarizeEvents(events);
+      const snapshot = getSessionFileSnapshot(filePath);
+      const summary = snapshot.summary;
       const meta = reg?.meta || {};
-      const sessionKey = reg?.sessionKey || `agent:${agent}:session:${sessionId}`;
+      const sessionKey = isHistory
+        ? `${reg?.sessionKey || `agent:${agent}:session:${sessionId}`}::${historyType}:${historySnapshotAt}`
+        : (reg?.sessionKey || `agent:${agent}:session:${sessionId}`);
       rows.push({
         agent,
         sessionId,
         sessionKey,
+        baseSessionKey: stripHistorySuffix(sessionKey),
         filePath,
-        label: meta.label || null,
+        label: meta.label || (isHistory ? `${historyType} (${historySnapshotAt})` : null),
         spawnedBy: meta.spawnedBy || null,
         spawnDepth: meta.spawnDepth ?? null,
         model: meta.model || null,
         modelProvider: meta.modelProvider || null,
-        updatedAt: meta.updatedAt || null,
+        updatedAt: meta.updatedAt || historySnapshotAt || null,
         channel: meta.channel || meta.lastChannel || null,
         summary,
+        firstMessageAt: snapshot.firstMessageAt || null,
+        spawnRecords: snapshot.spawnRecords || [],
+        completionRecords: snapshot.completionRecords || [],
+        isHistory,
+        historyType,
+        historySnapshotAt,
       });
     }
 
@@ -454,6 +723,7 @@ function loadRegistry() {
         agent,
         sessionId,
         sessionKey,
+        baseSessionKey: stripHistorySuffix(sessionKey),
         filePath: meta.sessionFile || path.join(sessionsDir, `${sessionId}.jsonl`),
         label: meta.label || null,
         spawnedBy: meta.spawnedBy || null,
@@ -463,6 +733,9 @@ function loadRegistry() {
         updatedAt: meta.updatedAt || null,
         channel: meta.channel || meta.lastChannel || null,
         summary: summarizeEvents([]),
+        firstMessageAt: null,
+        spawnRecords: [],
+        completionRecords: [],
       });
     }
   }
@@ -473,7 +746,7 @@ function loadRegistry() {
     return tb - ta;
   });
 
-  return rows;
+  return inferHistoryParentLinks(rows);
 }
 
 function buildSessionGraph(registry) {
@@ -481,21 +754,39 @@ function buildSessionGraph(registry) {
   return registry.map((row) => ({
     ...row,
     parent: row.spawnedBy ? bySessionKey.get(row.spawnedBy) || null : null,
-    children: registry.filter((x) => x.spawnedBy === row.sessionKey)
-      .sort((a, b) => compareByTime(
-        { timestamp: a.summary.startAt || a.summary.endAt || a.updatedAt },
-        { timestamp: b.summary.startAt || b.summary.endAt || b.updatedAt },
-      ))
-      .map((x) => ({
+    children: row.isHistory ? [] : [
+      ...registry.filter((x) => x.spawnedBy === row.sessionKey)
+        .sort((a, b) => compareByTime(
+          { timestamp: a.summary.startAt || a.summary.endAt || a.updatedAt },
+          { timestamp: b.summary.startAt || b.summary.endAt || b.updatedAt },
+        ))
+        .map((x) => ({
+          sessionKey: x.sessionKey,
+          sessionId: x.sessionId,
+          agent: x.agent,
+          label: x.label || x.agent,
+          endAt: x.summary.endAt,
+          startAt: x.summary.startAt,
+          visibleMessageCount: x.summary.visibleMessageCount,
+          missing: false,
+        })),
+      ...((row.missingChildren || []).map((x) => ({
         sessionKey: x.sessionKey,
-        sessionId: x.sessionId,
+        sessionId: null,
         agent: x.agent,
         label: x.label,
-        endAt: x.summary.endAt,
-        startAt: x.summary.startAt,
-        visibleMessageCount: x.summary.visibleMessageCount,
-      })),
+        endAt: x.endAt,
+        startAt: x.startAt,
+        visibleMessageCount: 0,
+        missing: true,
+      }))),
+    ],
   }));
+}
+
+function getDisplaySessionName(session) {
+  if (!session) return '';
+  return session.agent || session.label || 'unknown';
 }
 
 function normalizeEvent(event, session) {
@@ -513,7 +804,7 @@ function normalizeEvent(event, session) {
       isVisibleMessage: false,
       toolEntries: [],
       sessionKey: session.sessionKey,
-      sessionLabel: session.label || session.sessionId,
+      sessionLabel: getDisplaySessionName(session),
       agent: session.agent,
       raw: event,
     };
@@ -534,7 +825,7 @@ function normalizeEvent(event, session) {
     isVisibleMessage: classified.category === 'user' || classified.category === 'assistant',
     toolEntries: classified.toolEntries,
     sessionKey: session.sessionKey,
-    sessionLabel: session.label || session.sessionId,
+    sessionLabel: getDisplaySessionName(session),
     agent: session.agent,
     raw: event,
   };
@@ -548,9 +839,59 @@ function compareByTime(a, b) {
 
 function loadAllSessionEvents(registry) {
   return new Map(registry.map((session) => {
-    const events = parseJsonl(session.filePath).map((event) => normalizeEvent(event, session));
+    const events = getSessionFileSnapshot(session.filePath).events.map((event) => normalizeEvent(event, session));
     return [session.sessionKey, events];
   }));
+}
+
+function getChildrenByParent(registry) {
+  const childrenByParent = new Map();
+
+  for (const row of registry) {
+    if (!row.spawnedBy) continue;
+    if (!childrenByParent.has(row.spawnedBy)) {
+      childrenByParent.set(row.spawnedBy, []);
+    }
+    childrenByParent.get(row.spawnedBy).push(row);
+  }
+
+  for (const children of childrenByParent.values()) {
+    children.sort((a, b) => compareByTime(
+      { timestamp: a.summary.startAt || a.summary.endAt || a.updatedAt },
+      { timestamp: b.summary.startAt || b.summary.endAt || b.updatedAt },
+    ));
+  }
+
+  return childrenByParent;
+}
+
+function collectSessionSubtreeKeys(sessionKey, registry) {
+  const childrenByParent = getChildrenByParent(registry);
+  const collected = new Set();
+  const queue = [sessionKey];
+
+  while (queue.length) {
+    const currentKey = queue.shift();
+    if (!currentKey || collected.has(currentKey)) continue;
+    collected.add(currentKey);
+
+    for (const child of childrenByParent.get(currentKey) || []) {
+      queue.push(child.sessionKey);
+    }
+  }
+
+  return collected;
+}
+
+function loadSessionEvents(registry, sessionKeys = null) {
+  const wantedKeys = sessionKeys ? new Set(sessionKeys) : null;
+
+  return new Map(registry
+    .filter((session) => !wantedKeys || wantedKeys.has(session.sessionKey))
+    .map((session) => {
+      const events = getSessionFileSnapshot(session.filePath).events.map((event) => normalizeEvent(event, session));
+      return [session.sessionKey, events];
+    }));
 }
 
 function mergeSystemItems(items) {
@@ -582,7 +923,7 @@ function buildTimelineForSession(sessionKey, registry, eventMap, options = {}, d
   const root = bySessionKey.get(sessionKey);
   if (!root) return null;
 
-  const children = registry
+  const children = root.isHistory ? [] : registry
     .filter((row) => row.spawnedBy === sessionKey)
     .sort((a, b) => compareByTime(
       { timestamp: a.summary.startAt || a.summary.endAt || a.updatedAt },
@@ -631,7 +972,7 @@ function buildTimelineForSession(sessionKey, registry, eventMap, options = {}, d
         type: 'subsession',
         timestamp: child.summary.startAt || child.summary.endAt || child.updatedAt || null,
         sessionKey: child.sessionKey,
-        sessionLabel: child.label || child.sessionId,
+        sessionLabel: child.agent || child.label || 'unknown',
         agent: child.agent,
         count: child.summary.visibleMessageCount ?? ((childEvents?.items || []).filter((x) => x.type === 'message' && (x.displayRole === 'user' || x.displayRole === 'assistant')).length),
         totalEventCount: childEvents?.items?.length || 0,
@@ -680,17 +1021,22 @@ app.get('/api/sessions', (req, res) => {
 
 app.get('/api/session/:agent/:sessionId', (req, res) => {
   const { agent, sessionId } = req.params;
-  const registry = buildSessionGraph(loadRegistry());
-  const session = registry.find((x) => x.agent === agent && x.sessionId === sessionId) || null;
+  const requestedSessionKey = (req.query.sessionKey || '').toString().trim();
+  const rawRegistry = loadRegistry();
+  const registry = buildSessionGraph(rawRegistry);
+  const session = (requestedSessionKey
+    ? registry.find((x) => x.sessionKey === requestedSessionKey)
+    : registry.find((x) => x.agent === agent && x.sessionId === sessionId)) || null;
 
   if (!session) {
     return res.status(404).json({ error: 'session not found' });
   }
 
   const includeSystemEvents = ['1', 'true', 'yes'].includes(String(req.query.includeSystemEvents || '').toLowerCase());
-  const rawRegistry = loadRegistry();
-  const eventMap = loadAllSessionEvents(rawRegistry);
-  const timeline = buildTimelineForSession(session.sessionKey, rawRegistry, eventMap, { includeSystemEvents });
+  const subtreeKeys = collectSessionSubtreeKeys(session.sessionKey, rawRegistry);
+  const timelineRegistry = rawRegistry.filter((row) => subtreeKeys.has(row.sessionKey));
+  const eventMap = loadSessionEvents(timelineRegistry, subtreeKeys);
+  const timeline = buildTimelineForSession(session.sessionKey, timelineRegistry, eventMap, { includeSystemEvents });
 
   res.json({ session, timeline });
 });
@@ -703,7 +1049,7 @@ app.get('/api/search', (req, res) => {
   const results = [];
 
   for (const row of registry) {
-    const events = parseJsonl(row.filePath).map((event) => normalizeEvent(event, row));
+    const events = getSessionFileSnapshot(row.filePath).events.map((event) => normalizeEvent(event, row));
     for (const ev of events) {
       const text = (ev.text || '').toLowerCase();
       if (!text.includes(q)) continue;
@@ -725,7 +1071,8 @@ app.get('/api/search', (req, res) => {
 });
 
 app.use((_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.setHeader('Cache-Control', 'no-store');
+  res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
 });
 
 app.listen(PORT, () => {

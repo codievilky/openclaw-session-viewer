@@ -10,7 +10,15 @@
 - JSONL 事件时间线：user / assistant / toolCall / toolResult / model 事件
 - 基础全文搜索
 - 用户消息中的时间 envelope / 子代理前缀会尽量自动清洗
-- 自动刷新时，新增消息会有轻微丝滑淡入动画
+- 自动刷新时，新增消息会有轻微淡入动画
+
+## 当前架构
+
+- 后端：Node.js + Express
+- 前端：Vue 3 + Vite
+- 构建产物：`dist/`
+- 数据源：只读扫描 session 目录，不改 OpenClaw 数据
+- 不依赖数据库
 
 ## 启动
 
@@ -20,9 +28,20 @@ npm install
 npm start
 ```
 
-默认地址：
+说明：
 
-- <http://127.0.0.1:3847>
+- `npm start` 会先执行前端构建，再启动服务
+- 首页 HTML 走 `no-store`，前端 JS/CSS 走 Vite 哈希文件，避免浏览器吃到旧代码
+- 默认地址：<http://127.0.0.1:3847>
+
+## 开发
+
+```bash
+npm run build
+node server.js
+```
+
+如果你改了前端源码，重新执行一次 `npm run build` 即可生成最新的 `dist/`。
 
 ## Session 目录配置
 
@@ -49,19 +68,14 @@ OPENCLAW_AGENTS_ROOT=/path/to/agents npm start
 - 未配置时，仍然稳定回退到默认目录 `~/.openclaw/agents`
 - 支持 `~/xxx` 这种写法
 
-## 设计说明
+## 性能说明
 
-- 后端：Node.js + Express
-- 前端：原生 HTML/CSS/JS
-- 数据源：只读扫描 session 目录，不改 OpenClaw 数据
-- session 根目录通过环境变量配置，默认不改现有行为
-- 不依赖数据库
+这版做了几处优化：
 
-## 本地开发示例
-
-```bash
-OPENCLAW_SESSIONS_ROOT=~/.openclaw/agents npm run dev
-```
+- 打开单个会话时，只读取当前会话及其子会话子树，不再全量扫描所有事件
+- session 文件解析结果按文件 `mtime + size` 做内存缓存
+- 自动刷新增加防重入，且页面隐藏时跳过刷新
+- 新会话请求会中断旧请求，避免慢响应覆盖新点击
 
 ## 仓库边界说明
 
@@ -72,11 +86,3 @@ OPENCLAW_SESSIONS_ROOT=~/.openclaw/agents npm run dev
 ```
 
 不要在 `~/.openclaw/workspace` 内继续开发或直接发布，以免误把 agent 配置、memory、用户上下文等私有文件带入 Git 历史。
-
-## 后续可增强
-
-- 更强的全文索引
-- 会话折叠 / 虚拟滚动
-- tool call / tool result 成对展示
-- delivery-mirror 与真实回复去重
-- nginx 反代与开机自启
