@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenClaw Session Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">◎</div>
+        <div>
+          <h1>Session Viewer</h1>
+          <p>OpenClaw 本地会话时间线</p>
+        </div>
+      </div>
+
+      <div class="controls stack">
+        <input id="searchInput" placeholder="搜索主会话、agent、首条消息..." />
+        <button id="refreshBtn">刷新会话</button>
+      </div>
+
+      <div id="sessionList" class="session-list"></div>
+    </aside>
+
+    <main class="main">
+      <section class="hero">
+        <div>
+          <h2 id="detailTitle">选择一个会话</h2>
+          <p id="detailMeta">默认只显示 user / assistant 对话；子会话会折叠插入到同一时间线里。</p>
+        </div>
+        <div class="hero-actions">
+          <label class="toggle-row">
+            <input id="showSystemEvents" type="checkbox" />
+            <span>显示系统事件</span>
+          </label>
+          <div class="search-inline">
+            <input id="globalSearchInput" placeholder="全文搜索消息内容" />
+            <button id="globalSearchBtn">搜索</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-grid">
+        <section class="panel">
+          <h3>会话链路</h3>
+          <div id="sessionGraph" class="graph"></div>
+        </section>
+        <section class="panel panel-timeline">
+          <h3>聊天时间线</h3>
+          <div id="timeline" class="timeline empty">右侧会显示合并后的对话消息</div>
+        </section>
+      </section>
+
+      <section class="panel search-panel">
+        <h3>全文搜索结果</h3>
+        <div id="searchResults" class="search-results empty">输入关键词后可跨会话搜索</div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toolModal" class="modal-backdrop hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="toolModalTitle">
+      <div class="modal-head">
+        <div>
+          <h3 id="toolModalTitle">工具详情</h3>
+          <p id="toolModalMeta" class="modal-meta"></p>
+        </div>
+        <button id="toolModalClose" class="icon-btn" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-section">
+        <div class="modal-label">关键参数</div>
+        <div id="toolModalSummary" class="modal-summary"></div>
+      </div>
+      <div class="modal-section">
+        <div class="modal-label">Arguments JSON</div>
+        <pre id="toolModalArgs" class="modal-code"></pre>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
