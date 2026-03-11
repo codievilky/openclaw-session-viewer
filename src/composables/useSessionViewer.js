@@ -44,8 +44,7 @@ export function useSessionViewer() {
   const currentGraphSession = ref(null);
   const currentTimelineItems = ref([]);
   const showSystemEvents = ref(false);
-  const sidebarQuery = ref('');
-  const globalQuery = ref('');
+  const searchQuery = ref('');
   const searchResults = ref([]);
   const searchPerformed = ref(false);
   const searchLoading = ref(false);
@@ -77,7 +76,7 @@ export function useSessionViewer() {
   async function loadSessions({ silent = false } = {}) {
     loadingSessions.value = !silent;
     try {
-      const query = encodeURIComponent(sidebarQuery.value.trim());
+      const query = encodeURIComponent(searchQuery.value.trim());
       const res = await fetch(`/api/sessions?q=${query}&rootsOnly=1`, { cache: 'no-store' });
       const data = await res.json();
       const nextSessions = data.sessions || [];
@@ -161,7 +160,7 @@ export function useSessionViewer() {
   }
 
   async function doSearch() {
-    const query = globalQuery.value.trim();
+    const query = searchQuery.value.trim();
     if (!query) {
       searchResults.value = [];
       searchPerformed.value = false;
@@ -232,10 +231,13 @@ export function useSessionViewer() {
     selectedToolDetail.value = null;
   }
 
-  watch(sidebarQuery, () => {
+  watch(searchQuery, () => {
     if (sidebarSearchTimer) clearTimeout(sidebarSearchTimer);
     sidebarSearchTimer = setTimeout(() => {
-      loadSessions().catch((error) => {
+      Promise.all([
+        loadSessions(),
+        doSearch(),
+      ]).catch((error) => {
         detailError.value = error?.message || '加载会话失败';
       });
     }, 180);
@@ -272,8 +274,7 @@ export function useSessionViewer() {
     currentGraphSession,
     currentTimelineItems,
     showSystemEvents,
-    sidebarQuery,
-    globalQuery,
+    searchQuery,
     searchResults,
     searchPerformed,
     searchLoading,
