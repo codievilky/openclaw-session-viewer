@@ -334,6 +334,52 @@ function safeStringify(value, spacing = 2) {
   }
 }
 
+function getDisplayValue(value) {
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    const text = getTextContent(value).trim();
+    return text || value;
+  }
+  return value;
+}
+
+function pickToolOutput(item) {
+  if (!item || typeof item !== 'object') return null;
+  return getDisplayValue(
+    item.result
+    ?? item.output
+    ?? item.response
+    ?? item.content
+    ?? item.details
+    ?? item.text
+    ?? null,
+  );
+}
+
+function getToolResultLabel(item) {
+  const output = pickToolOutput(item);
+  return safeStringify(output, 2);
+}
+
+function describeMessageLifecycle(message) {
+  if (!message || typeof message !== 'object') return '';
+
+  const stopReason = String(message.stopReason || '').trim();
+  if (stopReason) {
+    if (stopReason === 'stop') return '系统处理结束';
+    return `系统处理结束（${stopReason}）`;
+  }
+
+  const finishReason = String(message.finishReason || '').trim();
+  if (finishReason) {
+    return finishReason === 'stop'
+      ? '系统处理结束'
+      : `系统处理结束（${finishReason}）`;
+  }
+
+  return '';
+}
+
 function pickToolArguments(item) {
   return item.arguments ?? item.args ?? item.input ?? item.params ?? item.parameters ?? null;
 }
@@ -352,17 +398,22 @@ function getToolEntriesFromContent(content, fallbackTimestamp = null) {
         timestamp: item.timestamp || fallbackTimestamp || null,
         arguments: args,
         rawArguments: safeStringify(args || item, 2),
+        result: pickToolOutput(item),
+        rawResult: getToolResultLabel(item),
       }];
     }
     if (item.type === 'toolResult') {
+      const result = pickToolOutput(item);
       return [{
         type: 'toolResult',
         name: item.name || item.toolName || 'tool',
         title: item.name || item.toolName || 'tool',
-        summary: summarizeJson(item.result || item.output || item.content || ''),
+        summary: summarizeJson(result || ''),
         timestamp: item.timestamp || fallbackTimestamp || null,
         arguments: pickToolArguments(item),
         rawArguments: safeStringify(pickToolArguments(item), 2),
+        result,
+        rawResult: getToolResultLabel(item),
       }];
     }
     return [];
@@ -375,14 +426,17 @@ function getToolEntriesFromMessage(message) {
   if (contentEntries.length) return contentEntries;
 
   if (message.role === 'toolResult') {
+    const result = pickToolOutput(message);
     return [{
       type: 'toolResult',
       name: message.name || message.toolName || 'tool',
       title: message.name || message.toolName || 'tool',
-      summary: summarizeJson(message.result || message.output || message.content || message.text || ''),
+      summary: summarizeJson(result || ''),
       timestamp: message.timestamp || null,
       arguments: pickToolArguments(message),
       rawArguments: safeStringify(pickToolArguments(message), 2),
+      result,
+      rawResult: getToolResultLabel(message),
     }];
   }
 
@@ -427,9 +481,11 @@ function classifyMessage(event) {
 
   const msg = event.message;
   const role = msg.role || null;
-  const text = getTextContent(msg.content).trim();
+  const lifecycleText = describeMessageLifecycle(msg);
+  const visibleText = getTextContent(msg.content).trim();
+  const text = (visibleText || lifecycleText).trim();
   const toolEntries = getToolEntriesFromMessage(msg);
-  const hasVisibleText = Boolean(text);
+  const hasVisibleText = Boolean(visibleText);
   const lowerRole = String(role || '').toLowerCase();
 
   if (toolEntries.length && !hasVisibleText) {
@@ -501,9 +557,19 @@ function classifyMessage(event) {
 
 function sanitizeMarkdown(text) {
   const rawHtml = marked.parse(text || '');
-  return DOMPurify.sanitize(rawHtml, {
+  const sanitizedHtml = DOMPurify.sanitize(rawHtml, {
     USE_PROFILES: { html: true },
+    ADD_ATTR: ['target', 'rel'],
   });
+
+  if (!sanitizedHtml || !sanitizedHtml.includes('<a')) return sanitizedHtml;
+
+  const document = new JSDOM(sanitizedHtml).window.document;
+  for (const anchor of document.querySelectorAll('a[href]')) {
+    anchor.setAttribute('target', '_blank');
+    anchor.setAttribute('rel', 'noopener noreferrer');
+  }
+  return document.body.innerHTML;
 }
 
 function summarizeEvents(events) {
@@ -894,6 +960,71 @@ function loadSessionEvents(registry, sessionKeys = null) {
     }));
 }
 
+function buildSearchExcerpt(text, query, radius = 42) {
+  const normalizedText = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalizedText) return '';
+  const lowerText = normalizedText.toLowerCase();
+  const index = lowerText.indexOf(query);
+  if (index < 0) return normalizedText.slice(0, 140);
+
+  const start = Math.max(0, index - radius);
+  const end = Math.min(normalizedText.length, index + query.length + radius);
+  const prefix = start > 0 ? '…' : '';
+  const suffix = end < normalizedText.length ? '…' : '';
+  return `${prefix}${normalizedText.slice(start, end)}${suffix}`;
+}
+
+function findVisibleMessageMatch(session, query) {
+  if (!session?.filePath || !query) return null;
+  const events = getSessionFileSnapshot(session.filePath).events;
+
+  for (const event of events) {
+    const normalized = normalizeEvent(event, session);
+    if (!normalized.isVisibleMessage) continue;
+    if (!String(normalized.text || '').toLowerCase().includes(query)) continue;
+
+    const roleLabel = normalized.displayRole === 'user' ? 'User' : 'Assistant';
+    const sourceLabel = session.label && session.label !== session.agent ? session.label : session.agent;
+    const excerpt = buildSearchExcerpt(normalized.text, query);
+
+    return {
+      text: normalized.text,
+      role: normalized.displayRole,
+      timestamp: normalized.timestamp,
+      agent: session.agent,
+      sessionKey: session.sessionKey,
+      sessionLabel: sourceLabel,
+      preview: `命中 ${roleLabel} · ${sourceLabel}: ${excerpt}`,
+    };
+  }
+
+  return null;
+}
+
+function findSessionContentMatch(row, query, rawRegistry, { includeSubtree = false } = {}) {
+  if (!row || !query) return null;
+
+  const currentSession = rawRegistry.find((session) => session.sessionKey === row.sessionKey) || null;
+  const candidateSessions = [];
+  if (currentSession) candidateSessions.push(currentSession);
+
+  if (includeSubtree) {
+    const subtreeKeys = collectSessionSubtreeKeys(row.sessionKey, rawRegistry);
+    for (const session of rawRegistry) {
+      if (session.sessionKey === row.sessionKey) continue;
+      if (!subtreeKeys.has(session.sessionKey)) continue;
+      candidateSessions.push(session);
+    }
+  }
+
+  for (const session of candidateSessions) {
+    const match = findVisibleMessageMatch(session, query);
+    if (match) return match;
+  }
+
+  return null;
+}
+
 function mergeSystemItems(items) {
   const merged = [];
 
@@ -998,12 +1129,14 @@ app.get('/api/sessions', (req, res) => {
   const q = (req.query.q || '').toString().trim().toLowerCase();
   const agent = (req.query.agent || '').toString().trim();
   const rootsOnly = !['0', 'false', 'no'].includes(String(req.query.rootsOnly || '1').toLowerCase());
-  const registry = buildSessionGraph(loadRegistry());
+  const rawRegistry = loadRegistry();
+  const registry = buildSessionGraph(rawRegistry);
+  const contentMatchCache = new Map();
 
-  const filtered = registry.filter((row) => {
-    if (rootsOnly && !isMainSession(row)) return false;
-    if (agent && row.agent !== agent) return false;
-    if (!q) return true;
+  const filtered = registry.flatMap((row) => {
+    if (rootsOnly && !isMainSession(row)) return [];
+    if (agent && row.agent !== agent) return [];
+    if (!q) return [row];
     const hay = [
       row.agent,
       row.sessionId,
@@ -1013,7 +1146,14 @@ app.get('/api/sessions', (req, res) => {
       row.summary.firstUser || '',
       row.summary.lastText || '',
     ].join('\n').toLowerCase();
-    return hay.includes(q);
+    if (hay.includes(q)) return [row];
+
+    const cacheKey = `${row.sessionKey}::${rootsOnly ? 'subtree' : 'self'}::${q}`;
+    if (!contentMatchCache.has(cacheKey)) {
+      contentMatchCache.set(cacheKey, findSessionContentMatch(row, q, rawRegistry, { includeSubtree: rootsOnly }));
+    }
+    const searchMatch = contentMatchCache.get(cacheKey);
+    return searchMatch ? [{ ...row, searchMatch }] : [];
   });
 
   res.json({ sessions: filtered });

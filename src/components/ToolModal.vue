@@ -12,6 +12,9 @@ const meta = computed(() => {
   if (!props.entry) return '';
   return `${props.entry.name || 'tool'} · ${fmtTime(props.entry.timestamp)} · ${props.entry.type === 'toolResult' ? '结果' : '调用'}`;
 });
+
+const hasArguments = computed(() => Boolean(props.entry?.rawArguments));
+const hasResult = computed(() => Boolean(props.entry?.rawResult));
 </script>
 
 <template>
@@ -28,9 +31,13 @@ const meta = computed(() => {
         <div class="modal-label">关键参数</div>
         <div class="modal-summary">{{ entry.summary || '—' }}</div>
       </div>
-      <div class="modal-section">
+      <div v-if="hasArguments" class="modal-section">
         <div class="modal-label">Arguments JSON</div>
-        <pre class="modal-code">{{ entry.rawArguments || '—' }}</pre>
+        <pre class="modal-code">{{ entry.rawArguments }}</pre>
+      </div>
+      <div v-if="hasResult" class="modal-section">
+        <div class="modal-label">返回内容</div>
+        <pre class="modal-code">{{ entry.rawResult }}</pre>
       </div>
     </div>
   </div>

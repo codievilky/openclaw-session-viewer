@@ -5,6 +5,7 @@ import { fmtTime, formatClockTime, formatDayLabel, getTodayDayKey, toLocalDayKey
 const props = defineProps({
   sessions: { type: Array, required: true },
   currentKey: { type: String, default: null },
+  searchQuery: { type: String, default: '' },
 });
 
 const emit = defineEmits(['open']);
@@ -116,11 +117,20 @@ function getSessionMeta(session) {
 
 function getSessionSnippet(session) {
   if (session.isHistory) return '';
+  if (session.searchMatch?.preview) return session.searchMatch.preview;
   return (session.summary?.firstUser || session.summary?.lastText || '').slice(0, 140);
 }
 
 function isDayExpanded(dayKey) {
   return expandedDayKeys.value.has(dayKey);
+}
+
+function openSessionFromList(session) {
+  const searchQuery = String(props.searchQuery || '').trim();
+  const options = searchQuery
+    ? { searchQuery, triggerSearchFocus: true }
+    : undefined;
+  emit('open', session.agent, session.sessionId, session.sessionKey, options);
 }
 </script>
 
@@ -144,7 +154,7 @@ function isDayExpanded(dayKey) {
           type="button"
           class="session-item"
           :class="{ active: currentKey === session.sessionKey, historical: session.isHistory }"
-          @click="emit('open', session.agent, session.sessionId, session.sessionKey)"
+          @click="openSessionFromList(session)"
         >
           <div class="top">
             <div class="title">{{ getSessionTitle(session) }}</div>

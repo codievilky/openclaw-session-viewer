@@ -1,13 +1,14 @@
 <script setup>
 import { computed, ref } from 'vue';
 import SessionList from './components/SessionList.vue';
-import SearchResults from './components/SearchResults.vue';
 import TimelineNode from './components/TimelineNode.vue';
 import ToolModal from './components/ToolModal.vue';
 import { useSessionViewer } from './composables/useSessionViewer';
 
 const viewer = useSessionViewer();
 const copyFeedback = ref('');
+const heroSection = ref(null);
+const timelineBottomAnchor = ref(null);
 let copyFeedbackTimer = null;
 
 const timelineEmptyText = computed(() => {
@@ -39,11 +40,19 @@ async function copySessionPath() {
 }
 
 function scrollToBottom() {
-  window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+  if (timelineBottomAnchor.value) {
+    timelineBottomAnchor.value.scrollIntoView({ behavior: 'auto', block: 'end' });
+    return;
+  }
+  window.scrollTo({ top: document.documentElement?.scrollHeight || document.body?.scrollHeight || 0, behavior: 'auto' });
 }
 
 function scrollToTop() {
-  window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (heroSection.value) {
+    heroSection.value.scrollIntoView({ behavior: 'auto', block: 'start' });
+    return;
+  }
+  window.scrollTo({ top: 0, behavior: 'auto' });
 }
 </script>
 
@@ -65,21 +74,22 @@ function scrollToTop() {
       <SessionList
         :sessions="viewer.sessions.value"
         :current-key="viewer.currentKey.value"
+        :search-query="viewer.searchQuery.value"
         @open="viewer.openSession"
       />
     </aside>
 
     <main class="main">
-      <section class="hero">
+      <section ref="heroSection" class="hero">
         <div>
           <h2>{{ viewer.detailTitle.value }}</h2>
           <p>{{ viewer.detailMeta.value }}</p>
         </div>
-        <div class="hero-actions">
-          <label class="toggle-row">
-            <input v-model="viewer.showSystemEvents.value" type="checkbox" />
-            <span>显示系统事件</span>
-          </label>
+        <div v-if="viewer.currentGraphSession.value" class="hero-actions">
+          <div class="hero-path" :title="currentSessionFilePath">{{ currentSessionPathShort }}</div>
+          <div class="hero-action-row">
+            <button type="button" :disabled="!currentSessionFilePath" @click="copySessionPath">{{ copyFeedback || '复制路径' }}</button>
+          </div>
         </div>
       </section>
 
@@ -89,41 +99,37 @@ function scrollToTop() {
           <span v-if="viewer.loadingSession.value" class="loading-pill">加载中…</span>
         </div>
 
-        <div v-if="viewer.currentGraphSession.value" class="timeline-floatbar">
-          <div class="timeline-floatbar-main">
-            <div class="timeline-floatbar-path" :title="currentSessionFilePath">{{ currentSessionPathShort }}</div>
-          </div>
-          <div class="timeline-floatbar-actions">
-            <button type="button" :disabled="!currentSessionFilePath" @click="copySessionPath">{{ copyFeedback || '复制路径' }}</button>
-            <button type="button" @click="scrollToTop">顶部</button>
-            <button type="button" @click="scrollToBottom">底部</button>
-          </div>
-        </div>
-
         <div v-if="!viewer.currentTimelineItems.value.length" class="timeline empty">{{ timelineEmptyText }}</div>
         <div v-else class="timeline">
           <TimelineNode
             v-for="item in viewer.currentTimelineItems.value"
             :key="`${item.type}-${item.sessionKey || ''}-${item.timestamp || ''}-${item.text || item.kind || ''}`"
             :item="item"
-            :expanded-sessions="viewer.expandedSessions"
+            :expanded-sessions="viewer.expandedSessions.value"
             :new-message-keys="viewer.newMessageKeys.value"
             :new-subsession-keys="viewer.newSubsessionKeys.value"
+            :active-search-message-key="viewer.activeSearchMessageKey.value"
+            :active-search-query="viewer.activeSearchQuery.value"
             @toggle-session="viewer.toggleExpandedSession"
             @open-tool="viewer.openTool"
           />
+          <div ref="timelineBottomAnchor" class="timeline-anchor" aria-hidden="true"></div>
         </div>
       </section>
 
-      <section class="panel search-panel">
-        <h3>全文搜索结果</h3>
-        <SearchResults
-          :results="viewer.searchResults.value"
-          :searched="viewer.searchPerformed.value"
-          :loading="viewer.searchLoading.value"
-          @open="viewer.openSession"
-        />
-      </section>
+      <div v-if="viewer.currentGraphSession.value" class="page-fab" aria-label="页面操作">
+        <div class="page-fab-actions">
+          <button type="button" class="page-fab-btn" @click="scrollToTop">顶部</button>
+          <button type="button" class="page-fab-btn" @click="scrollToBottom">底部</button>
+        </div>
+        <label class="page-fab-switch" :class="{ active: viewer.showSystemEvents.value }">
+          <span class="page-fab-switch-label">系统事件</span>
+          <input v-model="viewer.showSystemEvents.value" type="checkbox" />
+          <span class="page-fab-switch-track" aria-hidden="true">
+            <span class="page-fab-switch-thumb"></span>
+          </span>
+        </label>
+      </div>
     </main>
 
     <ToolModal :entry="viewer.selectedToolDetail.value" @close="viewer.closeTool" />

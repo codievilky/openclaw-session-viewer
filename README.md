@@ -34,6 +34,35 @@ npm start
 - 首页 HTML 走 `no-store`，前端 JS/CSS 走 Vite 哈希文件，避免浏览器吃到旧代码
 - 默认地址：<http://127.0.0.1:3847>
 
+## 使用 PM2 启动
+
+先确保已安装 `pm2`，然后在项目目录执行：
+
+```bash
+pm2 start ecosystem.config.js
+```
+
+常用命令：
+
+```bash
+pm2 status
+pm2 logs openclaw-session-viewer
+pm2 restart openclaw-session-viewer
+pm2 stop openclaw-session-viewer
+```
+
+如果需要自定义 session 根目录，可以在启动前带上环境变量：
+
+```bash
+OPENCLAW_SESSIONS_ROOT=/path/to/agents pm2 start ecosystem.config.js
+```
+
+说明：
+
+- `pm2` 会执行 `npm start`
+- `npm start` 会先构建前端，再启动 `server.js`
+- 默认应用名是 `openclaw-session-viewer`
+
 ## 开发
 
 ```bash

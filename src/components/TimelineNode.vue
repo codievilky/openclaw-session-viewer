@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue';
-import { fmtTime, getMessageStableKey, getSubsessionStableKey } from '../lib/format';
+import { fmtTime, getMessageStableKey, getSubsessionStableKey, getSystemDetailStableKey, highlightHtmlText } from '../lib/format';
 
 defineOptions({ name: 'TimelineNode' });
 
@@ -9,6 +9,8 @@ const props = defineProps({
   expandedSessions: { type: Object, required: true },
   newMessageKeys: { type: Object, required: true },
   newSubsessionKeys: { type: Object, required: true },
+  activeSearchMessageKey: { type: String, default: '' },
+  activeSearchQuery: { type: String, default: '' },
 });
 
 const emit = defineEmits(['toggle-session', 'open-tool']);
@@ -16,6 +18,14 @@ const emit = defineEmits(['toggle-session', 'open-tool']);
 const isSubsessionExpanded = computed(() => props.expandedSessions.has(props.item.sessionKey));
 const isNewMessage = computed(() => props.newMessageKeys.has(getMessageStableKey(props.item)));
 const isNewSubsession = computed(() => props.newSubsessionKeys.has(getSubsessionStableKey(props.item)));
+const messageStableKey = computed(() => getMessageStableKey(props.item));
+const isActiveSearchMessage = computed(() => messageStableKey.value && props.activeSearchMessageKey === messageStableKey.value);
+const renderedMessageHtml = computed(() => {
+  const fallback = '<p>（无文本）</p>';
+  const html = props.item.html || fallback;
+  if (!isActiveSearchMessage.value || !props.activeSearchQuery) return html;
+  return highlightHtmlText(html, props.activeSearchQuery);
+});
 
 function handleToggle(event) {
   emit('toggle-session', props.item.sessionKey, event.target.open);
@@ -37,6 +47,8 @@ function handleToggle(event) {
           :expanded-sessions="expandedSessions"
           :new-message-keys="newMessageKeys"
           :new-subsession-keys="newSubsessionKeys"
+          :active-search-message-key="activeSearchMessageKey"
+          :active-search-query="activeSearchQuery"
           @toggle-session="(...args) => emit('toggle-session', ...args)"
           @open-tool="(entry) => emit('open-tool', entry)"
         />
@@ -45,13 +57,17 @@ function handleToggle(event) {
     </details>
   </div>
 
-  <div v-else-if="item.type === 'message' && (item.displayRole === 'user' || item.displayRole === 'assistant')" class="message-row" :class="[item.displayRole, { 'is-new': isNewMessage }]">
-    <article class="bubble">
+  <div
+    v-else-if="item.type === 'message' && (item.displayRole === 'user' || item.displayRole === 'assistant')"
+    class="message-row"
+    :class="[item.displayRole, { 'is-new': isNewMessage, 'is-search-hit': isActiveSearchMessage }]"
+  >
+    <article class="bubble" :data-message-key="messageStableKey">
       <div class="message-head">
         <span>{{ item.displayRole === 'user' ? 'User' : 'Assistant' }} · {{ item.sessionLabel || item.agent }}</span>
         <span>{{ fmtTime(item.timestamp) }}</span>
       </div>
-      <div class="message-body" v-html="item.html || '<p>（无文本）</p>'"></div>
+      <div class="message-body" v-html="renderedMessageHtml"></div>
     </article>
   </div>
 
@@ -78,7 +94,7 @@ function handleToggle(event) {
   </div>
 
   <div v-else-if="item.type === 'system'" class="system-lane">
-    <details class="system-ribbon system-detail">
+    <details class="system-ribbon system-detail" :data-system-detail-key="getSystemDetailStableKey(item)">
       <summary class="system-ribbon-head">
         <span>系统事件 · {{ item.sessionLabel || item.agent }}</span>
         <span>{{ fmtTime(item.timestamp) }}</span>

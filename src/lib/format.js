@@ -55,6 +55,59 @@ export function getSubsessionStableKey(item) {
   return [item.sessionKey || '', item.timestamp || '', item.count || 0].join('::');
 }
 
+export function getSystemDetailStableKey(item) {
+  return [item.sessionKey || '', item.timestamp || '', item.kind || '', item.text || ''].join('::');
+}
+
+export function highlightHtmlText(html, query, className = 'search-hit') {
+  if (!html || !query || typeof document === 'undefined' || typeof NodeFilter === 'undefined') return html;
+
+  const normalizedQuery = String(query || '').trim().toLowerCase();
+  if (!normalizedQuery) return html;
+
+  const container = document.createElement('div');
+  container.innerHTML = html;
+
+  const textNodes = [];
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  let currentNode = walker.nextNode();
+  while (currentNode) {
+    if (String(currentNode.nodeValue || '').toLowerCase().includes(normalizedQuery)) {
+      textNodes.push(currentNode);
+    }
+    currentNode = walker.nextNode();
+  }
+
+  for (const textNode of textNodes) {
+    const source = String(textNode.nodeValue || '');
+    const lowerSource = source.toLowerCase();
+    const fragment = document.createDocumentFragment();
+    let cursor = 0;
+
+    while (cursor < source.length) {
+      const hitIndex = lowerSource.indexOf(normalizedQuery, cursor);
+      if (hitIndex < 0) {
+        fragment.append(document.createTextNode(source.slice(cursor)));
+        break;
+      }
+
+      if (hitIndex > cursor) {
+        fragment.append(document.createTextNode(source.slice(cursor, hitIndex)));
+      }
+
+      const mark = document.createElement('mark');
+      mark.className = className;
+      mark.textContent = source.slice(hitIndex, hitIndex + normalizedQuery.length);
+      fragment.append(mark);
+      cursor = hitIndex + normalizedQuery.length;
+    }
+
+    textNode.parentNode?.replaceChild(fragment, textNode);
+  }
+
+  return container.innerHTML;
+}
+
 export function isNearBottom(threshold = 48) {
   const scroller = document.scrollingElement || document.documentElement;
   return scroller.scrollHeight - (scroller.scrollTop + window.innerHeight) <= threshold;
@@ -64,16 +117,16 @@ export function snapshotScrollState() {
   const scroller = document.scrollingElement || document.documentElement;
   return {
     wasNearBottom: isNearBottom(),
-    previousBottomOffset: scroller.scrollHeight - scroller.scrollTop,
+    scrollTop: scroller.scrollTop,
   };
 }
 
-export function restoreScrollState({ wasNearBottom, previousBottomOffset }) {
+export function restoreScrollState({ wasNearBottom, scrollTop = 0 }) {
   const scroller = document.scrollingElement || document.documentElement;
   if (wasNearBottom) {
     window.scrollTo({ top: scroller.scrollHeight, behavior: 'auto' });
     return;
   }
-  const nextTop = Math.max(0, scroller.scrollHeight - previousBottomOffset);
+  const nextTop = Math.max(0, scrollTop);
   window.scrollTo({ top: nextTop, behavior: 'auto' });
 }

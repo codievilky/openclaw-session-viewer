@@ -1,6 +1,26 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { deepEqual, fmtTime, getMessageStableKey, getSubsessionStableKey, restoreScrollState, snapshotScrollState } from '../lib/format';
 
+function createReactiveSet(values = []) {
+  return reactive(new Set(values));
+}
+
+function waitForFrame() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+async function findMessageElement(messageKey, attempts = 6) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const target = document.querySelector(`[data-message-key="${CSS.escape(messageKey)}"]`);
+    if (target) return target;
+    await nextTick();
+    await waitForFrame();
+  }
+  return null;
+}
+
 function safeSet(base) {
   return base instanceof Set ? base : new Set();
 }
@@ -37,6 +57,24 @@ function rememberTimelineKeys(items, seenMessageKeys, seenSubsessionKeys) {
   }
 }
 
+function findTimelineQueryTarget(items, normalizedQuery, ancestorSessionKeys = []) {
+  for (const item of items || []) {
+    if (item.type === 'message' && (item.displayRole === 'user' || item.displayRole === 'assistant')) {
+      if (String(item.text || '').toLowerCase().includes(normalizedQuery)) {
+        return { item, ancestorSessionKeys };
+      }
+    }
+
+    if (item.type === 'subsession') {
+      const nextAncestors = item.sessionKey ? [...ancestorSessionKeys, item.sessionKey] : ancestorSessionKeys;
+      const found = findTimelineQueryTarget(item.items || [], normalizedQuery, nextAncestors);
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
 export function useSessionViewer() {
   const sessions = ref([]);
   const currentKey = ref(null);
@@ -45,23 +83,24 @@ export function useSessionViewer() {
   const currentTimelineItems = ref([]);
   const showSystemEvents = ref(false);
   const searchQuery = ref('');
-  const searchResults = ref([]);
-  const searchPerformed = ref(false);
-  const searchLoading = ref(false);
   const selectedToolDetail = ref(null);
   const loadingSessions = ref(false);
   const loadingSession = ref(false);
   const detailError = ref('');
   const lastUpdatedAt = ref(null);
   const pendingFocusSessionKey = ref(null);
-  const expandedSessions = reactive(new Set());
+  const expandedSessions = ref(createReactiveSet());
   const newMessageKeys = ref(new Set());
   const newSubsessionKeys = ref(new Set());
+  const activeSearchMessageKey = ref('');
+  const activeSearchQuery = ref('');
   const seenTimelineMessageKeys = new Set();
   const seenTimelineSubsessionKeys = new Set();
+  const sessionViewStates = new Map();
 
   let autoRefreshTimer = null;
   let autoRefreshInFlight = false;
+  let autoRefreshPausedUntil = 0;
   let sidebarSearchTimer = null;
   let sessionLoadSeq = 0;
   let sessionAbortController = null;
@@ -72,6 +111,88 @@ export function useSessionViewer() {
     if (!session) return '默认只显示 user / assistant 对话；子会话会折叠插入到同一时间线里。';
     return `${session.agent} · ${session.modelProvider || ''} ${session.model || ''} · ${fmtTime(session.summary?.startAt)} → ${fmtTime(session.summary?.endAt)} · 可见消息 ${session.summary?.visibleMessageCount ?? 0}`;
   });
+
+  function collectOpenSystemDetailKeys() {
+    return [...document.querySelectorAll('details[data-system-detail-key][open]')]
+      .map((node) => node.dataset.systemDetailKey)
+      .filter(Boolean);
+  }
+
+  function persistCurrentViewState() {
+    const requestKey = currentSession.value?.requestKey;
+    if (!requestKey) return;
+    sessionViewStates.set(requestKey, {
+      scrollState: snapshotScrollState(),
+      expandedSessionKeys: [...expandedSessions.value],
+      openSystemDetailKeys: collectOpenSystemDetailKeys(),
+    });
+  }
+
+  function restoreExpandedSessions(expandedSessionKeys = []) {
+    expandedSessions.value = createReactiveSet(expandedSessionKeys);
+  }
+
+  function restoreOpenSystemDetails(openSystemDetailKeys = []) {
+    const nextKeys = new Set(openSystemDetailKeys);
+    for (const node of document.querySelectorAll('details[data-system-detail-key]')) {
+      node.open = nextKeys.has(node.dataset.systemDetailKey);
+    }
+  }
+
+  function clearActiveSearchHighlight() {
+    activeSearchMessageKey.value = '';
+    activeSearchQuery.value = '';
+  }
+
+  async function focusSearchQuery(query) {
+    const normalizedQuery = String(query || '').trim().toLowerCase();
+    if (!normalizedQuery) {
+      clearActiveSearchHighlight();
+      return false;
+    }
+
+    const found = findTimelineQueryTarget(currentTimelineItems.value, normalizedQuery);
+    if (!found) {
+      clearActiveSearchHighlight();
+      return false;
+    }
+
+    for (const sessionKey of found.ancestorSessionKeys) {
+      expandedSessions.value.add(sessionKey);
+    }
+
+    const messageKey = getMessageStableKey(found.item);
+    await nextTick();
+    const target = await findMessageElement(messageKey);
+    if (!target) return false;
+
+    target.scrollIntoView({ behavior: 'auto', block: 'center' });
+
+    activeSearchMessageKey.value = messageKey;
+    activeSearchQuery.value = String(query || '').trim();
+
+    await nextTick();
+    const refreshedTarget = document.querySelector(`[data-message-key="${CSS.escape(messageKey)}"]`) || target;
+    refreshedTarget.classList.remove('flash-focus');
+    void refreshedTarget.offsetWidth;
+    refreshedTarget.classList.add('flash-focus');
+    return true;
+  }
+
+  async function restoreSessionViewState(requestKey, { resetScroll = false } = {}) {
+    const viewState = sessionViewStates.get(requestKey);
+    restoreExpandedSessions(viewState?.expandedSessionKeys || []);
+    await nextTick();
+    restoreOpenSystemDetails(viewState?.openSystemDetailKeys || []);
+    await waitForFrame();
+    if (viewState?.scrollState) {
+      restoreScrollState(viewState.scrollState);
+      return;
+    }
+    if (resetScroll) {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+    }
+  }
 
   async function loadSessions({ silent = false } = {}) {
     loadingSessions.value = !silent;
@@ -115,8 +236,18 @@ export function useSessionViewer() {
     loadingSession.value = true;
     if (sessionAbortController) sessionAbortController.abort();
     sessionAbortController = new AbortController();
+    const previousRequestKey = currentSession.value?.requestKey || null;
+    const isSessionSwitch = Boolean(previousRequestKey && previousRequestKey !== requestKey);
+    const triggerSearchFocus = Boolean(options.triggerSearchFocus);
+    const searchFocusQuery = String(options.searchQuery || '').trim();
 
-    const scrollState = options.preserveScroll ? snapshotScrollState() : null;
+    if (triggerSearchFocus) {
+      autoRefreshPausedUntil = Date.now() + 3000;
+    }
+
+    if (isSessionSwitch) {
+      persistCurrentViewState();
+    }
 
     try {
       const data = await fetchSession(agent, sessionId, sessionAbortController.signal, sessionKey);
@@ -144,8 +275,33 @@ export function useSessionViewer() {
       rememberTimelineKeys(nextItems, seenTimelineMessageKeys, seenTimelineSubsessionKeys);
       lastUpdatedAt.value = Date.now();
 
-      await nextTick();
-      if (scrollState && !sessionChanged) restoreScrollState(scrollState);
+      if (sessionChanged) {
+        const hasSavedViewState = sessionViewStates.has(requestKey);
+        if (!hasSavedViewState) {
+          restoreExpandedSessions();
+        }
+
+        await nextTick();
+
+        if (hasSavedViewState) {
+          await restoreSessionViewState(requestKey);
+        } else {
+          restoreOpenSystemDetails([]);
+          await waitForFrame();
+          if (!options.preserveScroll) {
+            window.scrollTo({ top: 0, behavior: 'auto' });
+          }
+        }
+      } else {
+        await nextTick();
+      }
+
+      if (triggerSearchFocus && searchFocusQuery) {
+        await focusSearchQuery(searchFocusQuery);
+      } else if (sessionChanged) {
+        clearActiveSearchHighlight();
+      }
+
       if (pendingFocusSessionKey.value) {
         focusSubsession(pendingFocusSessionKey.value);
         pendingFocusSessionKey.value = null;
@@ -159,32 +315,13 @@ export function useSessionViewer() {
     }
   }
 
-  async function doSearch() {
-    const query = searchQuery.value.trim();
-    if (!query) {
-      searchResults.value = [];
-      searchPerformed.value = false;
-      return;
-    }
-    searchLoading.value = true;
-    searchPerformed.value = true;
-    try {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`, { cache: 'no-store' });
-      const data = await res.json();
-      searchResults.value = data.results || [];
-      lastUpdatedAt.value = Date.now();
-    } finally {
-      searchLoading.value = false;
-    }
-  }
-
   async function autoRefreshTick() {
-    if (autoRefreshInFlight || document.hidden) return;
+    if (autoRefreshInFlight || document.hidden || loadingSession.value || Date.now() < autoRefreshPausedUntil) return;
     autoRefreshInFlight = true;
     try {
       await loadSessions({ silent: true });
       if (currentSession.value) {
-        await openSession(currentSession.value.agent, currentSession.value.sessionId, currentSession.value.sessionKey || undefined, { preserveScroll: true });
+        await openSession(currentSession.value.agent, currentSession.value.sessionId, currentSession.value.sessionKey || undefined);
       }
     } finally {
       autoRefreshInFlight = false;
@@ -203,13 +340,13 @@ export function useSessionViewer() {
 
   function toggleExpandedSession(sessionKey, open) {
     if (!sessionKey) return;
-    if (open) expandedSessions.add(sessionKey);
-    else expandedSessions.delete(sessionKey);
+    if (open) expandedSessions.value.add(sessionKey);
+    else expandedSessions.value.delete(sessionKey);
   }
 
   function focusSubsession(sessionKey) {
     if (!sessionKey) return;
-    expandedSessions.add(sessionKey);
+    expandedSessions.value.add(sessionKey);
     nextTick(() => {
       const target = document.getElementById(`subsession-wrap-${sessionKey}`) || document.querySelector(`details[data-session-key="${CSS.escape(sessionKey)}"]`);
       if (!target) {
@@ -233,11 +370,11 @@ export function useSessionViewer() {
 
   watch(searchQuery, () => {
     if (sidebarSearchTimer) clearTimeout(sidebarSearchTimer);
+    if (!String(searchQuery.value || '').trim()) {
+      clearActiveSearchHighlight();
+    }
     sidebarSearchTimer = setTimeout(() => {
-      Promise.all([
-        loadSessions(),
-        doSearch(),
-      ]).catch((error) => {
+      loadSessions().catch((error) => {
         detailError.value = error?.message || '加载会话失败';
       });
     }, 180);
@@ -245,7 +382,7 @@ export function useSessionViewer() {
 
   watch(showSystemEvents, () => {
     if (currentSession.value) {
-      openSession(currentSession.value.agent, currentSession.value.sessionId, currentSession.value.sessionKey || undefined, { preserveScroll: true });
+      openSession(currentSession.value.agent, currentSession.value.sessionId, currentSession.value.sessionKey || undefined);
     }
   });
 
@@ -275,9 +412,6 @@ export function useSessionViewer() {
     currentTimelineItems,
     showSystemEvents,
     searchQuery,
-    searchResults,
-    searchPerformed,
-    searchLoading,
     selectedToolDetail,
     loadingSession,
     detailError,
@@ -286,10 +420,11 @@ export function useSessionViewer() {
     expandedSessions,
     newMessageKeys,
     newSubsessionKeys,
+    activeSearchMessageKey,
+    activeSearchQuery,
     lastUpdatedAt,
     loadSessions,
     openSession,
-    doSearch,
     toggleExpandedSession,
     focusSubsession,
     openTool,
